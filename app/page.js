@@ -2,7 +2,7 @@
 import { useRef, useState, useEffect } from "react";
 
 export default function Page() {
-  // ---------- 狀態 ----------
+  // -------- 狀態 --------
   const [kw, setKw] = useState("");
   const [lastKw, setLastKw] = useState("");
   const [current, setCurrent] = useState(null);
@@ -36,22 +36,28 @@ export default function Page() {
   };
   const excludeQS = () => encodeURIComponent(Array.from(seenRef.current).join(","));
 
-  // 建議
-  const [suggestions, setSuggestions] = useState([]);
+  // 建議（關鍵字 & 相似歌手）
+  const [suggestions, setSuggestions] = useState([]);        // 關鍵字建議（舊）
+  const [artistSuggestions, setArtistSuggestions] = useState([]); // 相似歌手/團體（新）
+
   const fetchSuggest = async (q) => {
     try {
       const r = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`);
       const j = await r.json();
-      const list = (j?.suggestions || []).slice(0, 4);
-      if (list.length) { setSuggestions(list); return; }
-      // fallback
-      setSuggestions([q, `${q} MV`, `${q} 官方`, `${q} 經典`].slice(0,4));
-    } catch {
-      setSuggestions([q, `${q} MV`, `${q} 官方`, `${q} 經典`].slice(0,4));
-    }
+      setSuggestions((j?.suggestions || []).slice(0, 4));
+    } catch { setSuggestions([]); }
+  };
+  const fetchRelatedArtists = async (q) => {
+    try {
+      const r = await fetch(`/api/related?q=${encodeURIComponent(q)}`);
+      const j = await r.json();
+      setArtistSuggestions((j?.suggestions || []).slice(0, 4));
+    } catch { setArtistSuggestions([]); }
   };
 
-  // ---------- YouTube IFrame ----------
+  // -------- YouTube IFrame（單一 onStateChange，避免閃爍） --------
+  const roundTokenRef = useRef(0); // 每題一個 token，避免舊事件干擾
+
   useEffect(() => {
     if (window.YT && window.YT.Player) { setYtReady(true); return; }
     const tag = document.createElement("script");
@@ -65,11 +71,34 @@ export default function Page() {
     playerObj.current = new window.YT.Player(playerRef.current, {
       width: "100%", height: "100%", videoId: "",
       playerVars: { controls: 0, modestbranding: 1, rel: 0, playsinline: 1, fs: 0, disablekb: 1, iv_load_policy: 3 },
-      events: { onReady: () => {} },
+      events: {
+        onStateChange: (e) => {
+          // 只處理「CUED」狀態，避免播放造成閃爍
+          if (e.data === window.YT.PlayerState.CUED) {
+            const token = roundTokenRef.current;
+            const meta = (playerObj.current && playerObj.current.__meta) || null;
+            if (!meta || meta.token !== token) return;
+            try {
+              playerObj.current.seekTo(meta.t, true);
+              // 不要 play；直接確保停在該幀
+              playerObj.current.pauseVideo();
+            } catch {}
+          }
+        }
+      },
     });
   }, [ytReady]);
 
-  // ---------- 計時器 ----------
+  const cueClip = (videoId, t) => {
+    if (!playerObj.current) return;
+    roundTokenRef.current += 1;
+    const token = roundTokenRef.current;
+    playerObj.current.__meta = { token, t };
+    // 用「cueVideoById」直接載入到目標秒數，不播放 → 不會閃
+    playerObj.current.cueVideoById({ videoId, startSeconds: t });
+  };
+
+  // -------- 計時器 --------
   const startTimerIfNeeded = () => {
     if (gameStarted) return;
     setGameStarted(true);
@@ -82,7 +111,10 @@ export default function Page() {
           clearInterval(timerRef.current);
           timerRef.current = null;
           setGameOver(true);
-          fetchSuggest(lastKw || kw); // 結束時抓建議
+          // 結束：抓相似歌手/團體（主）以及關鍵字建議（備用）
+          const base = lastKw || kw;
+          fetchRelatedArtists(base);
+          fetchSuggest(base);
           return 0;
         }
         return prev - 1;
@@ -90,7 +122,7 @@ export default function Page() {
     }, 1000);
   };
 
-  // ---------- 預取 & 出題 ----------
+  // -------- 預取 & 出題 --------
   const prefetchNext = async (key) => {
     try {
       const r = await fetch(`/api/pick?kw=${encodeURIComponent(key)}&exclude=${excludeQS()}`);
@@ -112,15 +144,7 @@ export default function Page() {
     if (prefetched && prefetched.videoId && !seenRef.current.has(String(prefetched.videoId))) {
       const data = prefetched; setPrefetched(null); setCurrent(data);
       pushSeen(data.videoId);
-      playerObj.current?.loadVideoById(data.videoId);
-      const handler = (e) => {
-        if (e.data === window.YT.PlayerState.PLAYING) {
-          playerObj.current.seekTo(data.t, true);
-          setTimeout(() => playerObj.current.pauseVideo(), 120);
-          playerObj.current.removeEventListener("onStateChange", handler);
-        }
-      };
-      playerObj.current.addEventListener("onStateChange", handler);
+      cueClip(data.videoId, data.t);
       setQCount(v=>v+1);
       prefetchNext(key);
       return;
@@ -133,18 +157,8 @@ export default function Page() {
       if (!r.ok) throw new Error(data?.error || "Pick failed");
       setCurrent(data);
       pushSeen(data.videoId);
-
-      playerObj.current?.loadVideoById(data.videoId);
-      const handler = (e) => {
-        if (e.data === window.YT.PlayerState.PLAYING) {
-          playerObj.current.seekTo(data.t, true);
-          setTimeout(() => playerObj.current.pauseVideo(), 120);
-          playerObj.current.removeEventListener("onStateChange", handler);
-        }
-      };
-      playerObj.current.addEventListener("onStateChange", handler);
+      cueClip(data.videoId, data.t);
       setQCount(v=>v+1);
-
       prefetchNext(key);
     } catch (e) {
       alert(e.message);
@@ -153,7 +167,7 @@ export default function Page() {
     }
   };
 
-  // ---------- 作答 ----------
+  // -------- 作答 --------
   const choose = (idx) => {
     if (!current || revealed || gameOver) return;
     setPicked(idx);
@@ -165,20 +179,19 @@ export default function Page() {
     setTimeout(() => { if (!gameOver && timeLeft > 0) startRound(lastKw); }, 1500);
   };
 
-  // ---------- 重來 ----------
+  // -------- 重來 --------
   const restart = () => {
     setScore(0); setQCount(0); setCorrectCount(0); setWrongCount(0);
     setTimeLeft(60); setGameStarted(false); setGameOver(false);
     setCurrent(null); setPicked(null); setRevealed(false);
-    setPrefetched(null); setSuggestions([]);
+    setPrefetched(null); setSuggestions([]); setArtistSuggestions([]);
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     seenRef.current = new Set();
   };
 
   const accuracy = qCount ? Math.round((correctCount / qCount) * 100) : 0;
 
-  // ---------- 版面：100dvh 五區塊，不用滑動 ----------
-  // rows: 標題(6dvh) / 搜尋(9dvh) / HUD(8dvh) / 播放器(34dvh, 內含 16:9 box) / 選項或結算(剩餘)
+  // -------- 版面（維持一屏、不換行 HUD） --------
   const layout = {
     height: "100dvh",
     display: "grid",
@@ -187,9 +200,7 @@ export default function Page() {
     padding: "2.2dvw",
     boxSizing: "border-box",
   };
-
   const titleStyle = { fontSize: "clamp(16px,4.2vw,20px)", margin: 0, alignSelf: "center" };
-
   const hudGrid = {
     display: "grid",
     gridTemplateColumns: "repeat(4,1fr)",
@@ -199,11 +210,10 @@ export default function Page() {
   const hudItem = {
     background: "#111", color: "#fff", borderRadius: "2.8dvw",
     textAlign: "center", fontWeight: 900,
-    fontSize: "clamp(12px,3.6vw,16px)", // 調小避免換行
-    padding: "0.9dvh 0.6dvw",
+    fontSize: "clamp(12px,3.4vw,15px)", // 再小一點，確保單行
+    padding: "0.8dvh 0.6dvw",
     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
   };
-
   const choiceBtn = (state) => ({
     textAlign:"left",
     border: state.chosen ? "0.6vw solid #888" : "0.4vw solid #ccc",
@@ -212,17 +222,15 @@ export default function Page() {
     fontSize: "clamp(13px,3.6vw,16px)",
     padding: "1.2dvh 1.8dvw",
     borderRadius: "3.4dvw",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis"
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
   });
 
   return (
     <main className="container" style={layout}>
-      {/* 1) 標題（小字，不占高） */}
+      {/* 1) 標題 */}
       <h1 className="h1" style={titleStyle}>🎵 GuessWhat — MV 猜歌（60 秒挑戰）</h1>
 
-      {/* 2) 搜尋列（單行） */}
+      {/* 2) 搜尋列 */}
       <div className="row" style={{display:"grid", gridTemplateColumns:"1fr auto", gap:"1.2dvw", alignItems:"center"}}>
         <input
           value={kw}
@@ -239,7 +247,7 @@ export default function Page() {
         </button>
       </div>
 
-      {/* 3) HUD（四等分，一行顯示） */}
+      {/* 3) HUD */}
       <div style={hudGrid}>
         <div style={hudItem}>⏱ {timeLeft}s</div>
         <div style={hudItem}>⭐ {score}</div>
@@ -247,7 +255,7 @@ export default function Page() {
         <div style={hudItem}>🎯 {accuracy}%</div>
       </div>
 
-      {/* 4) 播放器（容器 34dvh，內放 16:9 影片） */}
+      {/* 4) 播放器（16:9）+ 上方 15% 遮蔽 */}
       <div style={{ position:"relative", width:"100%", height:"100%", background:"#000", borderRadius:"3vw" }}>
         <div style={{ position:"absolute", inset:0, display:"grid", placeItems:"center" }}>
           <div style={{ width:"100%", height:"100%", maxHeight:"100%", aspectRatio:"16/9", position:"relative" }}>
@@ -264,7 +272,7 @@ export default function Page() {
         )}
       </div>
 
-      {/* 5) 選項 或 結算（保證在一屏內） */}
+      {/* 5) 選項 / 結束 */}
       <div style={{ overflow:"hidden" }}>
         {/* 四選一 */}
         {current && !gameOver && (
@@ -289,7 +297,7 @@ export default function Page() {
           </div>
         )}
 
-        {/* 結束畫面 + 4 個建議（點即開局） */}
+        {/* 結束畫面：優先顯示「相似歌手/團體」4 個建議 → 一點即開局 */}
         {gameOver && (
           <div className="card" style={{padding:"1.2dvh 1.6dvw"}}>
             <div style={{fontSize:"clamp(14px,3.8vw,18px)", fontWeight:800, marginBottom:"0.6dvh"}}>⏱️ 時間到！</div>
@@ -297,11 +305,11 @@ export default function Page() {
               分數 <b>{score}</b> ／ 題數 <b>{qCount}</b> ／ 正確 <b>{correctCount}</b> ／ 錯誤 <b>{wrongCount}</b> ／ 命中率 <b>{accuracy}%</b>
             </div>
 
-            {/* 四個建議按鈕（一定顯示，抓不到就用 fallback） */}
+            {/* 相似歌手/團體（主） */}
             <div style={{marginTop:"1dvh"}}>
-              <div className="small" style={{marginBottom:"0.6dvh"}}>再玩一次（基於「{lastKw || kw}」的關聯搜尋）：</div>
+              <div className="small" style={{marginBottom:"0.6dvh"}}>再玩一次（與「{lastKw || kw}」相似的歌手/團體）：</div>
               <div style={{display:"grid", gap:"0.8dvh", gridTemplateColumns:"repeat(2,1fr)"}}>
-                {(suggestions.length ? suggestions : [lastKw || kw, `${lastKw || kw} MV`, `${lastKw || kw} 官方`, `${lastKw || kw} 熱門`]).slice(0,4).map((s, i)=>(
+                {(artistSuggestions.length ? artistSuggestions : suggestions.length ? suggestions : [lastKw||kw, `${lastKw||kw} MV`, `${lastKw||kw} 熱門`, `${lastKw||kw} 精選`]).slice(0,4).map((s, i)=>(
                   <button
                     key={i}
                     className="button"
