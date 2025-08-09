@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-// utils
+// ===== utils =====
 const ISO8601toSeconds = (iso) => {
   const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
   if (!m) return 0;
@@ -11,8 +11,8 @@ const ISO8601toSeconds = (iso) => {
 };
 const clean = (s = "") => s.replace(/\s*\(.*?\)|\s*\[.*?\]/g, "").trim();
 const norm = (s = "") => s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, "");
-const pickRand = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const pickRand = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const parseArtist = (title, channel) => {
   if (title.includes(" - ")) {
     const left = title.split(" - ")[0].trim();
@@ -20,17 +20,22 @@ const parseArtist = (title, channel) => {
   }
   return channel || "";
 };
+const keyOf = (t,a) => `${norm(t)}|${norm(a)}`;
 
-// 更像官方 MV 的判斷（加分 / 減分）
+// 更像 MV 的判斷（強化）
 const looksLikeMV = (title, desc, channel) => {
-  const include =
-    /(official|music\s*video|mv|官方|完整版)/i.test(title) ||
-    /(official|music\s*video|mv|官方)/i.test(desc || "") ||
-    /vevo|official/i.test(channel || "");
-  const exclude =
-    /(lyric|lyrics|舞蹈|dance|cover|翻唱|reaction|reac|live|現場|舞台|彩排|teaser|trailer|audio|full album|topic)/i
-      .test(title);
-  return include && !exclude;
+  const t = (title||"").toLowerCase();
+  const d = (desc||"").toLowerCase();
+  const c = (channel||"").toLowerCase();
+
+  const INCLUDE = /(official(?!\s*audio)|music\s*video|mv|官方|完整版)/i.test(title) ||
+                  /(official(?!\s*audio)|music\s*video|mv|官方)/i.test(desc) ||
+                  /vevo|official/i.test(channel);
+
+  const EXCLUDE_WORDS = /(lyric|lyrics|字幕|歌詞|舞蹈|dance|practice|mirror|翻唱|cover|reaction|reac|live|現場|舞台|舞台直拍|fancam|fan cam|直拍|teaser|trailer|audio|visualizer|full album|topic|shorts)/i;
+  const EXCLUDE = EXCLUDE_WORDS.test(title) || EXCLUDE_WORDS.test(desc) || /topic/i.test(channel);
+
+  return INCLUDE && !EXCLUDE;
 };
 
 export const dynamic = "force-dynamic";
@@ -39,6 +44,12 @@ export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const kw = (searchParams.get("kw") || "").trim();
   if (!kw) return NextResponse.json({ error: "Missing kw" }, { status: 400 });
+
+  // 前端會傳 exclude=vid1,vid2,... 讓同局不重複
+  const exclude = (searchParams.get("exclude") || "")
+    .split(",")
+    .map(s=>s.trim())
+    .filter(Boolean);
 
   const key = process.env.YT_API_KEY;
   const region = process.env.REGION_CODE || "TW";
@@ -60,10 +71,14 @@ export async function GET(req) {
   const sRes = await fetch(searchUrl.toString());
   if (!sRes.ok) return NextResponse.json({ error: "YouTube search failed" }, { status: 502 });
   const sJson = await sRes.json();
-  const ids = (sJson.items || []).map(i => i.id?.videoId).filter(Boolean);
+  const ids = (sJson.items || [])
+    .map(i => i.id?.videoId)
+    .filter(Boolean)
+    .filter(id => !exclude.includes(id)); // 先在 id 層級排除
+
   if (!ids.length) return NextResponse.json({ error: "No results" }, { status: 404 });
 
-  // 2) videos
+  // 2) videos：取長度與完整 snippet
   const videosUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
   videosUrl.searchParams.set("key", key);
   videosUrl.searchParams.set("part", "contentDetails,snippet");
@@ -72,8 +87,8 @@ export async function GET(req) {
   if (!vRes.ok) return NextResponse.json({ error: "YouTube videos lookup failed" }, { status: 502 });
   const vJson = await vRes.json();
 
-  // 3) 篩選：≥120 秒 + MV 加分
-  const all = (vJson.items || []).map(v => {
+  // 3) 篩 MV + 去除被排除清單
+  let all = (vJson.items || []).map(v => {
     const duration = ISO8601toSeconds(v.contentDetails?.duration || "PT0S");
     const title = v.snippet?.title || "";
     const desc = v.snippet?.description || "";
@@ -81,77 +96,76 @@ export async function GET(req) {
     const score =
       (looksLikeMV(title, desc, channel) ? 2 : 0) +
       (/vevo|official/i.test(channel) ? 1 : 0) +
-      (/(official|mv|music\s*video|官方)/i.test(title) ? 1 : 0);
-    return { raw: v, duration, title, desc, channel, score };
-  }).filter(x => x.duration >= 120);
+      (/(official(?!\s*audio)|mv|music\s*video|官方)/i.test(title) ? 1 : 0);
+    return { raw: v, id: v.id, duration, title, desc, channel, score };
+  })
+  .filter(x => x.duration >= 120)
+  .filter(x => !exclude.includes(x.id));
+
+  // 若篩完太少，放寬：允許沒明確 "official"，但仍排除歌詞/翻唱/反應等
+  if (all.length < 8) {
+    all = (vJson.items || []).map(v => {
+      const duration = ISO8601toSeconds(v.contentDetails?.duration || "PT0S");
+      const title = v.snippet?.title || "";
+      const desc = v.snippet?.description || "";
+      const channel = v.snippet?.channelTitle || "";
+      const score =
+        (/vevo|official/i.test(channel) ? 1 : 0) +
+        (/(mv|music\s*video|官方)/i.test(title) ? 1 : 0);
+      return { raw: v, id: v.id, duration, title, desc, channel, score };
+    })
+    .filter(x => x.duration >= 120)
+    .filter(x => looksLikeMV(x.title, x.desc, x.channel) || x.score >= 1)
+    .filter(x => !exclude.includes(x.id));
+  }
 
   if (!all.length) return NextResponse.json({ error: "No playable candidates" }, { status: 404 });
 
-  // 4) 依分數排序，擴大 pool，之後才挑 1 正解 + 3 干擾
+  // 4) 排序 + 擴大 pool（用來生干擾選項）
   const sorted = all.sort((a,b)=> b.score - a.score);
   const pool = sorted.slice(0, 30);
 
-  // 正解
+  // 5) 正解
   const pick = pickRand(pool);
   const answerTitle = clean(pick.title);
   const answerArtist = parseArtist(pick.title, pick.channel);
-
-  // 5) 干擾選項：先嚴格（不同歌手 + 不同歌），不夠再放寬（同歌手但不同歌）
-  const seen = new Set();
-  const keyOf = (t,a) => `${norm(t)}|${norm(a)}`;
   const targetKey = keyOf(answerTitle, answerArtist);
 
-  const strictCandidates = pool
-    .concat(sorted.slice(30)) // 先用 pool，不夠再用其餘候選
-    .filter(c => {
-      const t = clean(c.title);
-      const a = parseArtist(c.title, c.channel);
-      const k = keyOf(t, a);
-      if (k === targetKey) return false;
-      // 嚴格：不同歌手且不同歌
-      return norm(a) !== norm(answerArtist) && norm(t) !== norm(answerTitle);
-    });
-
-  const relaxedCandidates = pool
-    .concat(sorted.slice(30))
-    .filter(c => {
-      const t = clean(c.title);
-      const a = parseArtist(c.title, c.channel);
-      const k = keyOf(t, a);
-      if (k === targetKey) return false;
-      // 放寬：允許同歌手但不同歌名
-      return norm(t) !== norm(answerTitle);
-    });
+  // 6) 干擾選項：先不同歌手不同歌，不夠再放寬
+  const seen = new Set();
+  const strict = pool.filter(c => {
+    const t = clean(c.title), a = parseArtist(c.title, c.channel);
+    return keyOf(t,a) !== targetKey && norm(t) !== norm(answerTitle) && norm(a) !== norm(answerArtist);
+  });
+  const relaxed = pool.filter(c => {
+    const t = clean(c.title), a = parseArtist(c.title, c.channel);
+    return keyOf(t,a) !== targetKey && norm(t) !== norm(answerTitle); // 允許同歌手不同歌
+  });
 
   const distractors = [];
   const pushUnique = (arr) => {
     for (const c of arr) {
-      const t = clean(c.title);
-      const a = parseArtist(c.title, c.channel);
-      const k = keyOf(t, a);
-      if (seen.has(k)) continue;
+      const t = clean(c.title), a = parseArtist(c.title, c.channel);
+      const k = keyOf(t,a);
+      if (seen.has(k) || k === targetKey) continue;
       seen.add(k);
       distractors.push({ title: t, artist: a });
       if (distractors.length >= 3) break;
     }
   };
-  // 先嚴格再放寬，保證至少 3 個，不再用 "—"
-  pushUnique(shuffle(strictCandidates));
-  if (distractors.length < 3) pushUnique(shuffle(relaxedCandidates));
-  if (distractors.length < 3) {
-    // 實在不夠就從全部裡補
-    pushUnique(shuffle(sorted));
-  }
+  pushUnique(shuffle(strict));
+  if (distractors.length < 3) pushUnique(shuffle(relaxed));
+  if (distractors.length < 3) pushUnique(shuffle(sorted));
   if (distractors.length < 3) return NextResponse.json({ error: "Not enough choices" }, { status: 502 });
 
   const choices = shuffle([{ title: answerTitle, artist: answerArtist }, ...distractors.slice(0,3)]);
   const correctIndex = choices.findIndex(c => keyOf(c.title, c.artist) === targetKey);
 
-  // 6) 隨機時間（避開片頭片尾）
+  // 7) 隨機時間（避開片頭片尾）
   const t = Math.floor(clamp(pick.duration * (0.25 + Math.random() * 0.5), 1, Math.max(1, pick.duration - 1)));
 
   return NextResponse.json({
-    videoId: pick.raw.id,
+    videoId: pick.id,
     duration: pick.duration,
     t,
     answerTitle,
@@ -161,12 +175,11 @@ export async function GET(req) {
   });
 }
 
-// Fisher–Yates shuffle
 function shuffle(arr) {
   const a = arr.slice();
-  for (let i=a.length-1;i>0;i--){
+  for (let i=a.length-1; i>0; i--) {
     const j = Math.floor(Math.random()*(i+1));
-    [a[i],a[j]] = [a[j],a[i]];
+    [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
 }
