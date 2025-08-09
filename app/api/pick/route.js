@@ -47,8 +47,7 @@ export async function GET(req) {
     searchUrl.searchParams.set("regionCode", region);
     searchUrl.searchParams.set("relevanceLanguage", lang);
     searchUrl.searchParams.set("q", kw);
-    // partial response
-    searchUrl.searchParams.set("fields","items(id/videoId,snippet/title,snippet/description,snippet/channelTitle)");
+    searchUrl.searchParams.set("fields", "items(id/videoId,snippet/title,snippet/description,snippet/channelTitle)");
 
     const sRes = await fetch(searchUrl.toString());
     if (!sRes.ok) throw new Error("YouTube search failed");
@@ -70,7 +69,7 @@ export async function GET(req) {
     videosUrl.searchParams.set("key", key);
     videosUrl.searchParams.set("part", "contentDetails,snippet");
     videosUrl.searchParams.set("id", ids);
-    videosUrl.searchParams.set("fields","items(id,contentDetails/duration,snippet/title,snippet/channelTitle,snippet/description)");
+    videosUrl.searchParams.set("fields", "items(id,contentDetails/duration,snippet/title,snippet/channelTitle,snippet/description)");
 
     const vRes = await fetch(videosUrl.toString());
     if (!vRes.ok) throw new Error("YouTube videos lookup failed");
@@ -89,10 +88,9 @@ export async function GET(req) {
     }).filter(x => x.duration >= 120);
   };
 
-  // 先尊重排重；若太少，再忽略排重補池子
   let all = await buildCandidates(false);
   if (all.length < 8 && exclude.length) {
-    all = await buildCandidates(true);
+    all = await buildCandidates(true); // 題庫不夠時，忽略排重重取
   }
   if (!all.length) return NextResponse.json({ error: "No playable candidates" }, { status: 404 });
 
@@ -101,23 +99,23 @@ export async function GET(req) {
 
   const pick = pickRand(pool);
   const answerTitle = pick.title;
-  const answerArtist = pick.channel; // 前端不顯示在選項，但用於統計/建議
+  const answerArtist = pick.channel; // 統計/推薦用（選項不顯示）
 
-  // 生成干擾（只回傳「標題字串」）
-  const keyOf = (t,a)=>`${norm(t)}|${norm(a)}`;
-  const target = keyOf(answerTitle, answerArtist);
-  const strict = pool.filter(c => keyOf(c.title,c.channel)!==target && norm(c.title)!==norm(answerTitle) && norm(c.channel)!==norm(answerArtist));
-  const relaxed = pool.filter(c => keyOf(c.title,c.channel)!==target && norm(c.title)!==norm(answerTitle));
+  // 生成干擾（只傳標題字串）
+  const normKey = (t,a)=>`${norm(t)}|${norm(a)}`;
+  const target = normKey(answerTitle, answerArtist);
+  const strict = pool.filter(c => normKey(c.title,c.channel)!==target && norm(c.title)!==norm(answerTitle) && norm(c.channel)!==norm(answerArtist));
+  const relaxed = pool.filter(c => normKey(c.title,c.channel)!==target && norm(c.title)!==norm(answerTitle));
 
   const seen = new Set(), distractors = [];
-  const pushU = (arr)=>{ for(const c of arr){ const k=keyOf(c.title,c.channel); if(seen.has(k)||k===target)continue; seen.add(k); distractors.push(c.title); if(distractors.length>=3)break; } };
+  const pushU = (arr)=>{ for(const c of arr){ const k=normKey(c.title,c.channel); if(seen.has(k)||k===target)continue; seen.add(k); distractors.push(c.title); if(distractors.length>=3)break; } };
   pushU(shuffle(strict)); if(distractors.length<3) pushU(shuffle(relaxed)); if(distractors.length<3) pushU(shuffle(sorted));
   if (distractors.length < 3) return NextResponse.json({ error: "Not enough choices" }, { status: 502 });
 
   const choices = shuffle([answerTitle, ...distractors.slice(0,3)]);
   const correctIndex = choices.findIndex(t => norm(t) === norm(answerTitle));
 
-  // 時間點均勻（5% ~ 95%）
+  // 平均分布於整段（避開 0~5% 與 95%~100%）
   const start = Math.floor(pick.duration * 0.05);
   const end   = Math.ceil(pick.duration * 0.95);
   const t = clamp(Math.floor(start + Math.random() * (end - start)), 1, Math.max(1, pick.duration - 1));
@@ -128,7 +126,7 @@ export async function GET(req) {
     t,
     answerTitle,
     answerArtist,
-    choices,       // 只有標題
+    choices,
     correctIndex
   });
 }
