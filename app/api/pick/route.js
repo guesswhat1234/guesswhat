@@ -13,13 +13,23 @@ const clean = (s = "") => s.replace(/\s*\(.*?\)|\s*\[.*?\]/g, "").trim();
 const norm = (s = "") => s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, "");
 const pickRand = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const parseArtist = (title, channel) => {
+  if (title.includes(" - ")) {
+    const left = title.split(" - ")[0].trim();
+    if (left && left.length <= 60) return left;
+  }
+  return channel || "";
+};
 
-// 像官方 MV 的判斷（加分 / 減分）
+// 更像官方 MV 的判斷（加分 / 減分）
 const looksLikeMV = (title, desc, channel) => {
-  const include = /(official|music\s*video|mv|官方|完整版)/i.test(title)
-               || /(official|music\s*video|mv|官方)/i.test(desc || "")
-               || /vevo|official/i.test(channel || "");
-  const exclude = /(lyric|lyrics|舞蹈|dance|cover|翻唱|reaction|reac|live|現場|舞台|彩排|teaser|trailer|audio|full album|topic)/i.test(title);
+  const include =
+    /(official|music\s*video|mv|官方|完整版)/i.test(title) ||
+    /(official|music\s*video|mv|官方)/i.test(desc || "") ||
+    /vevo|official/i.test(channel || "");
+  const exclude =
+    /(lyric|lyrics|舞蹈|dance|cover|翻唱|reaction|reac|live|現場|舞台|彩排|teaser|trailer|audio|full album|topic)/i
+      .test(title);
   return include && !exclude;
 };
 
@@ -35,13 +45,13 @@ export async function GET(req) {
   const lang = process.env.RELEVANCE_LANGUAGE || "zh-Hant";
   if (!key) return NextResponse.json({ error: "Missing YT_API_KEY" }, { status: 500 });
 
-  // 1) search
+  // 1) search：抓多一點候選
   const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
   searchUrl.searchParams.set("key", key);
   searchUrl.searchParams.set("part", "snippet");
   searchUrl.searchParams.set("type", "video");
-  searchUrl.searchParams.set("videoCategoryId", "10"); // Music
-  searchUrl.searchParams.set("maxResults", "40");
+  searchUrl.searchParams.set("videoCategoryId", "10");
+  searchUrl.searchParams.set("maxResults", "50");
   searchUrl.searchParams.set("safeSearch", "moderate");
   searchUrl.searchParams.set("regionCode", region);
   searchUrl.searchParams.set("relevanceLanguage", lang);
@@ -62,7 +72,7 @@ export async function GET(req) {
   if (!vRes.ok) return NextResponse.json({ error: "YouTube videos lookup failed" }, { status: 502 });
   const vJson = await vRes.json();
 
-  // 3) 篩選：≥120 秒，且更像官方 MV
+  // 3) 篩選：≥120 秒 + MV 加分
   const all = (vJson.items || []).map(v => {
     const duration = ISO8601toSeconds(v.contentDetails?.duration || "PT0S");
     const title = v.snippet?.title || "";
@@ -77,37 +87,65 @@ export async function GET(req) {
 
   if (!all.length) return NextResponse.json({ error: "No playable candidates" }, { status: 404 });
 
+  // 4) 依分數排序，擴大 pool，之後才挑 1 正解 + 3 干擾
   const sorted = all.sort((a,b)=> b.score - a.score);
-  const pool = sorted.slice(0, 15);
+  const pool = sorted.slice(0, 30);
 
-  // 4) 正解
+  // 正解
   const pick = pickRand(pool);
   const answerTitle = clean(pick.title);
-  const parseArtist = (title, channel) => {
-    if (title.includes(" - ")) {
-      const left = title.split(" - ")[0].trim();
-      if (left && left.length <= 60) return left;
-    }
-    return channel || "";
-  };
   const answerArtist = parseArtist(pick.title, pick.channel);
 
-  // 5) 生成 3 個干擾選項
-  const distractors = [];
-  for (const cand of pool) {
-    if (distractors.length >= 3) break;
-    const t = clean(cand.title);
-    const a = parseArtist(cand.title, cand.channel);
-    if (norm(t) === norm(answerTitle) && norm(a) === norm(answerArtist)) continue;
-    if (norm(a) === norm(answerArtist)) continue; // 盡量不同歌手
-    if (distractors.find(x => norm(x.title) === norm(t))) continue;
-    distractors.push({ title: t, artist: a });
-  }
-  while (distractors.length < 3) distractors.push({ title: "—", artist: "—" });
+  // 5) 干擾選項：先嚴格（不同歌手 + 不同歌），不夠再放寬（同歌手但不同歌）
+  const seen = new Set();
+  const keyOf = (t,a) => `${norm(t)}|${norm(a)}`;
+  const targetKey = keyOf(answerTitle, answerArtist);
 
-  const choices = [{ title: answerTitle, artist: answerArtist }, ...distractors.slice(0,3)]
-    .sort(() => Math.random() - 0.5);
-  const correctIndex = choices.findIndex(c => norm(c.title) === norm(answerTitle) && norm(c.artist) === norm(answerArtist));
+  const strictCandidates = pool
+    .concat(sorted.slice(30)) // 先用 pool，不夠再用其餘候選
+    .filter(c => {
+      const t = clean(c.title);
+      const a = parseArtist(c.title, c.channel);
+      const k = keyOf(t, a);
+      if (k === targetKey) return false;
+      // 嚴格：不同歌手且不同歌
+      return norm(a) !== norm(answerArtist) && norm(t) !== norm(answerTitle);
+    });
+
+  const relaxedCandidates = pool
+    .concat(sorted.slice(30))
+    .filter(c => {
+      const t = clean(c.title);
+      const a = parseArtist(c.title, c.channel);
+      const k = keyOf(t, a);
+      if (k === targetKey) return false;
+      // 放寬：允許同歌手但不同歌名
+      return norm(t) !== norm(answerTitle);
+    });
+
+  const distractors = [];
+  const pushUnique = (arr) => {
+    for (const c of arr) {
+      const t = clean(c.title);
+      const a = parseArtist(c.title, c.channel);
+      const k = keyOf(t, a);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      distractors.push({ title: t, artist: a });
+      if (distractors.length >= 3) break;
+    }
+  };
+  // 先嚴格再放寬，保證至少 3 個，不再用 "—"
+  pushUnique(shuffle(strictCandidates));
+  if (distractors.length < 3) pushUnique(shuffle(relaxedCandidates));
+  if (distractors.length < 3) {
+    // 實在不夠就從全部裡補
+    pushUnique(shuffle(sorted));
+  }
+  if (distractors.length < 3) return NextResponse.json({ error: "Not enough choices" }, { status: 502 });
+
+  const choices = shuffle([{ title: answerTitle, artist: answerArtist }, ...distractors.slice(0,3)]);
+  const correctIndex = choices.findIndex(c => keyOf(c.title, c.artist) === targetKey);
 
   // 6) 隨機時間（避開片頭片尾）
   const t = Math.floor(clamp(pick.duration * (0.25 + Math.random() * 0.5), 1, Math.max(1, pick.duration - 1)));
@@ -121,4 +159,14 @@ export async function GET(req) {
     choices,
     correctIndex
   });
+}
+
+// Fisher–Yates shuffle
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i=a.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
+  }
+  return a;
 }
