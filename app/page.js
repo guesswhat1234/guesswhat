@@ -2,8 +2,6 @@
 import { useRef, useState, useEffect } from "react";
 
 export default function Page() {
-  // …（你原本的 state 都保留）
-
   const [kw, setKw] = useState("");
   const [lastKw, setLastKw] = useState("");
   const [current, setCurrent] = useState(null);
@@ -26,92 +24,159 @@ export default function Page() {
   const [gameOver, setGameOver] = useState(false);
   const timerRef = useRef(null);
 
+  // 只記最近 40 題，避免題池被玩乾
   const seenRef = useRef(new Set());
+  const pushSeen = (vid) => {
+    seenRef.current.add(String(vid));
+    if (seenRef.current.size > 40) {
+      const first = seenRef.current.values().next().value;
+      seenRef.current.delete(first);
+    }
+  };
 
-  // ---- 載入 YouTube IFrame API（保證只載一次）----
+  // 統計歌手（API 保留 answerArtist，但選項不顯示）
+  const artistCountRef = useRef(new Map());
+  const countArtist = (name) => {
+    const k = String(name || "").trim();
+    if (!k) return;
+    artistCountRef.current.set(k, (artistCountRef.current.get(k) || 0) + 1);
+  };
+
+  // 玩家歷史搜尋（用來做 3 個一鍵再玩）
+  const kwHistoryRef = useRef([]);
+  const pushKw = (key) => {
+    const k = String(key || "").trim();
+    if (!k) return;
+    const arr = kwHistoryRef.current;
+    if (arr[arr.length - 1] !== k) arr.push(k);
+    if (arr.length > 100) arr.shift();
+  };
+  const historySuggestions = () => {
+    const seen = new Set();
+    const out = [];
+    const last = (lastKw || kw || "").trim().toLowerCase();
+    for (let i = kwHistoryRef.current.length - 1; i >= 0; i--) {
+      const v = String(kwHistoryRef.current[i] || "").trim();
+      if (!v) continue;
+      const low = v.toLowerCase();
+      if (low === last) continue;
+      if (seen.has(low)) continue;
+      seen.add(low);
+      out.push(v);
+      if (out.length >= 3) break;
+    }
+    return out;
+  };
+
+  // 依上次搜尋載入 YouTube 建議（結束時顯示 4 個）
+  const [suggestions, setSuggestions] = useState([]);
+  const loadSuggestions = async (q) => {
+    try {
+      const r = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`);
+      const j = await r.json();
+      setSuggestions(Array.isArray(j?.suggestions) ? j.suggestions.slice(0,4) : []);
+    } catch { setSuggestions([]); }
+  };
+
+  // YouTube IFrame API
   useEffect(() => {
     if (window.YT && window.YT.Player) { setYtReady(true); return; }
-    if (document.getElementById("yt-iframe-api")) { return; }
     const tag = document.createElement("script");
     tag.src = "https://www.youtube.com/iframe_api";
-    tag.id = "yt-iframe-api";
     document.body.appendChild(tag);
     window.onYouTubeIframeAPIReady = () => setYtReady(true);
   }, []);
-
-  // ---- 建立 Player：加上 origin / host，並預設靜音 ----
   useEffect(() => {
     if (!ytReady || !playerRef.current || playerObj.current) return;
     playerObj.current = new window.YT.Player(playerRef.current, {
-      width: "100%", height: "100%",
-      videoId: "",
-      host: "https://www.youtube.com",
-      playerVars: {
-        controls: 0,
-        modestbranding: 1,
-        rel: 0,
-        playsinline: 1,
-        fs: 0,
-        disablekb: 1,
-        iv_load_policy: 3,
-        origin: window.location.origin, // 重要：帶上你的網域
-      },
-      events: {
-        onReady: (e) => {
-          // 行動裝置政策：先靜音，之後短播 120ms 就能顯示畫面
-          try { e.target.mute(); } catch {}
-        }
-      },
+      width: "100%", height: "100%", videoId: "",
+      playerVars: { controls: 0, modestbranding: 1, rel: 0, playsinline: 1, fs: 0, disablekb: 1, iv_load_policy: 3 },
+      events: { onReady: () => {} },
     });
   }, [ytReady]);
 
-  // ---- 顯示指定影片的某時間點：cue → seek → 播 120ms → 暫停（穩定產生畫面）----
-  const displayFrame = (videoId, tSec) => {
-    const p = playerObj.current;
-    if (!p) return;
-    // 先靜音，確保行動裝置允許短暫播放
-    try { p.mute(); } catch {}
-    // 先 cue（不會直接播放）
-    p.cueVideoById({ videoId, startSeconds: Math.max(0, tSec - 0.2) });
-    // 等到狀態變成 CUED 再 seek + 播放一下
-    const onState = (e) => {
-      if (e.data === window.YT.PlayerState.CUED) {
-        p.seekTo(tSec, true);
-        p.playVideo();
-        setTimeout(() => {
-          p.pauseVideo();
-          // 保險：再 seek 一次目標秒，確保畫面停在該點
-          p.seekTo(tSec, true);
-        }, 120);
-        p.removeEventListener("onStateChange", onState);
-      }
-    };
-    p.addEventListener("onStateChange", onState);
+  // 計時器
+  const startTimerIfNeeded = () => {
+    if (gameStarted) return;
+    setGameStarted(true);
+    setTimeLeft(60);
+    setGameOver(false);
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current);
+          timerRef.current = null;
+          setGameOver(true);
+          loadSuggestions(lastKw || kw); // 結束時載入相關建議
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
   };
 
-  // ===== 你的出題流程：把過去用 loadVideoById + PLAYING 的地方換成 displayFrame =====
+  const excludeQS = () => encodeURIComponent(Array.from(seenRef.current).join(","));
+
+  // 預取下一題
+  const prefetchNext = async (key) => {
+    try {
+      const r = await fetch(`/api/pick?kw=${encodeURIComponent(key)}&exclude=${excludeQS()}`);
+      const data = await r.json();
+      if (r.ok) setPrefetched(data);
+    } catch {}
+  };
+
+  // 出題（優先用預取）
   const startRound = async (fixedKw) => {
     if (gameOver) return;
     const key = (fixedKw ?? kw).trim();
     if (!key) return alert("請先輸入關鍵字");
     setLastKw(key);
+    pushKw(key);           // 記錄這次玩家搜尋
+    startTimerIfNeeded();
+
     setPicked(null);
     setRevealed(false);
 
+    if (prefetched && prefetched.videoId && !seenRef.current.has(String(prefetched.videoId))) {
+      const data = prefetched; setPrefetched(null); setCurrent(data);
+      pushSeen(data.videoId); countArtist(data.answerArtist);
+      playerObj.current?.loadVideoById(data.videoId);
+      const handler = (e) => {
+        if (e.data === window.YT.PlayerState.PLAYING) {
+          playerObj.current.seekTo(data.t, true);
+          setTimeout(() => playerObj.current.pauseVideo(), 120);
+          playerObj.current.removeEventListener("onStateChange", handler);
+        }
+      };
+      playerObj.current.addEventListener("onStateChange", handler);
+      setQCount(prev=>prev+1);
+      prefetchNext(key);
+      return;
+    }
+
     setLoading(true);
     try {
-      // 省略：你原本取題的 fetch 流程（/api/pick …）
-      const exclude = encodeURIComponent(Array.from(seenRef.current).join(","));
-      const r = await fetch(`/api/pick?kw=${encodeURIComponent(key)}&exclude=${exclude}`);
+      const r = await fetch(`/api/pick?kw=${encodeURIComponent(key)}&exclude=${excludeQS()}`);
       const data = await r.json();
       if (!r.ok) throw new Error(data?.error || "Pick failed");
-
       setCurrent(data);
-      seenRef.current.add(String(data.videoId));
-      setQCount((c) => c + 1);
+      pushSeen(data.videoId);
+      countArtist(data.answerArtist);
 
-      // 這一行是關鍵：用 displayFrame 來顯示目標畫面
-      displayFrame(data.videoId, data.t);
+      playerObj.current?.loadVideoById(data.videoId);
+      const handler = (e) => {
+        if (e.data === window.YT.PlayerState.PLAYING) {
+          playerObj.current.seekTo(data.t, true);
+          setTimeout(() => playerObj.current.pauseVideo(), 120);
+          playerObj.current.removeEventListener("onStateChange", handler);
+        }
+      };
+      playerObj.current.addEventListener("onStateChange", handler);
+      setQCount(prev=>prev+1);
+
+      prefetchNext(key);
     } catch (e) {
       console.error(e);
       alert(e.message);
@@ -120,20 +185,180 @@ export default function Page() {
     }
   };
 
-  // ====== 其餘 UI / 計分 / 倒數 / 結束畫面等你的現有程式可原封保留 ======
-  // （略：請把你現有的四選一、HUD、結束畫面、建議三選項等邏輯接在下面）
+  // 作答：即判分，2 秒後自動下一題
+  const choose = (idx) => {
+    if (!current || revealed || gameOver) return;
+    setPicked(idx);
+    const correct = idx === current.correctIndex;
+    setScore(s => s + (correct ? 100 : 0));
+    setCorrectCount(c => c + (correct ? 1 : 0));
+    setWrongCount(w => w + (correct ? 0 : 1));
+    setRevealed(true);
+    setTimeout(() => { if (!gameOver && timeLeft > 0) startRound(lastKw); }, 2000);
+  };
+
+  // 重來
+  const restart = () => {
+    setScore(0); setQCount(0); setCorrectCount(0); setWrongCount(0);
+    setTimeLeft(60); setGameStarted(false); setGameOver(false);
+    setCurrent(null); setPicked(null); setRevealed(false);
+    setPrefetched(null); setSuggestions([]);
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    seenRef.current = new Set();
+    artistCountRef.current = new Map();
+    // kwHistoryRef 保留，以便跨局推薦
+  };
+
+  const accuracy = qCount ? Math.round((correctCount / qCount) * 100) : 0;
+
+  // —— 版面（iPhone 一屏玩完）— 用 vw/vh 自適應，四欄 HUD 等寬 ——
+  const hudGrid = {
+    display: "grid",
+    gridTemplateColumns: "repeat(4,1fr)",
+    gap: "1.8vw",
+    marginTop: "1.5vh",
+    alignItems: "stretch"
+  };
+  const hudItem = {
+    background: "#111",
+    color: "#fff",
+    borderRadius: "3vw",
+    padding: "1.6vh 0.8vw",
+    textAlign: "center",
+    fontWeight: 900,
+    fontSize: "clamp(14px, 3.8vw, 20px)",
+    lineHeight: 1.05
+  };
+  const choiceBtn = (state) => ({
+    textAlign:"left",
+    border: state.chosen ? "0.6vw solid #888" : "0.4vw solid #ccc",
+    background: state.correct ? "#2e7d32" : state.wrong ? "#b71c1c" : "#111",
+    color: "#fff",
+    fontSize: "clamp(14px, 3.8vw, 18px)",
+    padding: "1.6vh 2vw",
+    borderRadius: "3.5vw",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis"
+  });
+
   return (
-    <main className="container">
-      {/* 你的原本 JSX，記得保留播放器容器 */}
-      <div style={{ position:"relative", width:"100%", aspectRatio:"16/9", background:"#000", borderRadius:12 }}>
-        <div id="player" ref={playerRef} style={{ position:"absolute", inset:0 }}/>
-        {/* 上方 15% 黑遮蔽 */}
-        {current && !gameOver && (
+    <main className="container" style={{height:"100vh", display:"flex", flexDirection:"column", padding:"2.8vw"}}>
+      <h1 className="h1" style={{fontSize:"clamp(18px,5vw,22px)", margin:"0 0 1vh 0"}}>🎵 GuessWhat — MV 猜歌（60 秒挑戰）</h1>
+
+      {/* 搜尋列 */}
+      <div className="row" style={{gap:"2.4vw"}}>
+        <input
+          value={kw}
+          onChange={(e)=>setKw(e.target.value)}
+          placeholder="輸入歌手/關鍵字（例：周杰倫、抒情、2000s）"
+          className="input"
+          inputMode="search"
+          disabled={gameOver}
+          style={{fontSize:"clamp(14px,3.8vw,18px)", padding:"1.6vh 2vw"}}
+        />
+        <button onClick={()=>startRound()} disabled={loading || gameOver} className="button" style={{fontSize:"clamp(14px,3.8vw,18px)", padding:"1.6vh 2vw"}}>
+          {loading ? "出題中…" : (current ? "下一題" : "開始出題")}
+        </button>
+      </div>
+
+      {/* HUD（與播放器同寬，四等分） */}
+      <div style={hudGrid}>
+        <div style={hudItem}>⏱ {timeLeft}s</div>
+        <div style={hudItem}>⭐ {score}</div>
+        <div style={hudItem}>📊 {qCount} 題</div>
+        <div style={hudItem}>🎯 {accuracy}%</div>
+      </div>
+
+      {/* 中段：播放器（16:9），只保留上方 15% 黑遮蔽 */}
+      <div style={{ position:"relative", width:"100%", aspectRatio:"16/9", background:"#000", borderRadius:"3vw", marginTop:"1.5vh" }}>
+        <div id="player" ref={playerRef} style={{ position:"absolute", inset:0, width:"100%", height:"100%" }}/>
+        {(current && !gameOver) && (
           <div style={{ position:"absolute", left:0, right:0, top:0, height:"15%", background:"#000", pointerEvents:"none" }}/>
+        )}
+        {(loading && !current) && (
+          <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"#fff", background:"rgba(0,0,0,.25)", fontSize:"clamp(16px,4.2vw,22px)" }}>
+            出題中…
+          </div>
         )}
       </div>
 
-      {/* …其餘 HUD / 選項 / 結束畫面 */}
+      {/* 下段：四選一（單行省略避免換行溢出） */}
+      {current && !gameOver && (
+        <div style={{ display:"grid", gap:"1.2vh", marginTop:"1.2vh", overflow:"hidden" }}>
+          {current.choices?.map((title, idx) => {
+            const chosen = picked === idx;
+            const correct = revealed && idx === current.correctIndex;
+            const wrong = revealed && chosen && idx !== current.correctIndex;
+            return (
+              <button
+                key={idx}
+                onClick={() => choose(idx)}
+                className="button"
+                style={choiceBtn({chosen, correct, wrong})}
+                disabled={revealed}
+                title={title}
+              >
+                {String.fromCharCode(65+idx)}. {title}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 結束畫面 */}
+      {gameOver && (
+        <div style={{ marginTop:"1.5vh" }}>
+          <div style={{fontSize:"clamp(16px,4.2vw,22px)", fontWeight:800, marginBottom:"0.8vh"}}>⏱️ 時間到！成績單</div>
+          <div style={{fontSize:"clamp(14px,3.8vw,18px)"}}>
+            總題數：<strong>{qCount}</strong>　總分：<strong>{score}</strong>　正確：<strong>{correctCount}</strong>　錯誤：<strong>{wrongCount}</strong>　命中率：<strong>{accuracy}%</strong>
+          </div>
+
+          {/* 依玩家歷史選擇的 3 個一鍵再玩建議 */}
+          {historySuggestions().length > 0 && (
+            <div style={{marginTop:"1.2vh"}}>
+              <div style={{fontSize:"clamp(12px,3.4vw,16px)", color:"#555", marginBottom:"0.6vh"}}>
+                再玩一次（依你之前的搜尋）：
+              </div>
+              <div style={{ display:"grid", gap:"0.8vh", gridTemplateColumns:"repeat(3,1fr)" }}>
+                {historySuggestions().map((s, i)=>(
+                  <button
+                    key={i}
+                    className="button"
+                    onClick={()=>{ restart(); setKw(s); startRound(s); }}
+                    style={{fontSize:"clamp(14px,3.8vw,18px)", padding:"1.4vh 2vw"}}
+                    title={s}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 依「上次搜尋」的 YouTube 建議（最多 4 個） */}
+          {(lastKw || kw) && suggestions.length > 0 && (
+            <div style={{marginTop:"1.2vh"}}>
+              <div style={{fontSize:"clamp(12px,3.4vw,16px)", color:"#555", marginBottom:"0.6vh"}}>
+                你可能也會想找（基於「{lastKw || kw}」）：
+              </div>
+              <div style={{ display:"grid", gap:"0.8vh", gridTemplateColumns:"repeat(2,1fr)" }}>
+                {suggestions.map((s, i)=>(
+                  <button
+                    key={i}
+                    className="button"
+                    onClick={()=>{ restart(); setKw(s); startRound(s); }}
+                    style={{fontSize:"clamp(14px,3.8vw,18px)", padding:"1.4vh 2vw"}}
+                    title={s}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </main>
   );
 }
