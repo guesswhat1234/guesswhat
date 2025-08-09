@@ -2,7 +2,7 @@
 import { useRef, useState, useEffect } from "react";
 
 export default function Page() {
-  // ===== 狀態 =====
+  // 狀態
   const [kw, setKw] = useState("");
   const [lastKw, setLastKw] = useState("");
   const [current, setCurrent] = useState(null);
@@ -24,10 +24,27 @@ export default function Page() {
   const [gameOver, setGameOver] = useState(false);
   const timerRef = useRef(null);
 
-  // 同局不重複的 videoId 集合
+  // 同局排重（只保留最近 40 題，避免把池子玩乾）
   const seenRef = useRef(new Set());
+  const pushSeen = (vid) => {
+    seenRef.current.add(String(vid));
+    if (seenRef.current.size > 40) {
+      // 移除最舊的
+      const first = seenRef.current.values().next().value;
+      seenRef.current.delete(first);
+    }
+  };
 
-  // ===== 載入 YouTube IFrame API =====
+  // 蒐集出現過的「歌手/頻道」，供結束時推薦
+  const artistCountRef = useRef(new Map());
+  const countArtist = (name) => {
+    const k = String(name || "").trim();
+    if (!k) return;
+    const cur = artistCountRef.current.get(k) || 0;
+    artistCountRef.current.set(k, cur + 1);
+  };
+
+  // 載入 YouTube API
   useEffect(() => {
     if (window.YT && window.YT.Player) { setYtReady(true); return; }
     const tag = document.createElement("script");
@@ -42,14 +59,12 @@ export default function Page() {
     playerObj.current = new window.YT.Player(playerRef.current, {
       width: "100%", height: "100%",
       videoId: "",
-      playerVars: {
-        controls: 0, modestbranding: 1, rel: 0, playsinline: 1, fs: 0, disablekb: 1, iv_load_policy: 3
-      },
+      playerVars: { controls: 0, modestbranding: 1, rel: 0, playsinline: 1, fs: 0, disablekb: 1, iv_load_policy: 3 },
       events: { onReady: () => {} },
     });
   }, [ytReady]);
 
-  // ===== 計時器 =====
+  // 計時器
   const startTimerIfNeeded = () => {
     if (gameStarted) return;
     setGameStarted(true);
@@ -69,9 +84,9 @@ export default function Page() {
     }, 1000);
   };
 
-  // ===== 出題（可帶 fixedKw；未帶則用輸入框）=====
+  // 出題
   const startRound = async (fixedKw) => {
-    if (gameOver) return; // 時間到就不再出題
+    if (gameOver) return;
     const key = (fixedKw ?? kw).trim();
     if (!key) return alert("請先輸入關鍵字");
     setLastKw(key);
@@ -82,15 +97,14 @@ export default function Page() {
     setPicked(null);
 
     try {
-      // 同局不重複：把 seen 的 videoId 傳給後端
       const exclude = encodeURIComponent(Array.from(seenRef.current).join(","));
       const r = await fetch(`/api/pick?kw=${encodeURIComponent(key)}&exclude=${exclude}`);
       const data = await r.json();
       if (!r.ok) throw new Error(data?.error || "Pick failed");
       setCurrent(data);
-      seenRef.current.add(String(data.videoId));
+      pushSeen(data.videoId);
+      countArtist(data.answerArtist);
 
-      // 載入影片並跳到隨機秒數，立刻暫停
       playerObj.current?.loadVideoById(data.videoId);
       const handler = (e) => {
         if (e.data === window.YT.PlayerState.PLAYING) {
@@ -109,7 +123,7 @@ export default function Page() {
     }
   };
 
-  // ===== 作答：即判分，2 秒後自動下一題 =====
+  // 作答：即判分，2 秒後自動下一題
   const choose = (idx) => {
     if (!current || revealed || gameOver) return;
     setPicked(idx);
@@ -124,28 +138,22 @@ export default function Page() {
     }, 2000);
   };
 
-  // ===== 重來 =====
+  // 重新開始
   const restart = () => {
-    setScore(0);
-    setQCount(0);
-    setCorrectCount(0);
-    setWrongCount(0);
-    setTimeLeft(60);
-    setGameStarted(false);
-    setGameOver(false);
-    setCurrent(null);
-    setPicked(null);
-    setRevealed(false);
+    setScore(0); setQCount(0); setCorrectCount(0); setWrongCount(0);
+    setTimeLeft(60); setGameStarted(false); setGameOver(false);
+    setCurrent(null); setPicked(null); setRevealed(false);
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     seenRef.current = new Set();
+    artistCountRef.current = new Map();
   };
 
   const accuracy = qCount ? Math.round((correctCount / qCount) * 100) : 0;
 
-  // ===== 一鍵複製戰報 =====
+  // 複製戰報
   const copySummary = async () => {
     const url = window.location.href;
-    const text = `我在 GuessWhat MV 猜歌拿到 ${score} 分！\\n題數：${qCount}（正確 ${correctCount}、錯誤 ${wrongCount}，命中率 ${accuracy}%）\\n一起玩：${url}`;
+    const text = `我在 GuessWhat MV 猜歌拿到 ${score} 分！\n題數：${qCount}（正確 ${correctCount}、錯誤 ${wrongCount}，命中率 ${accuracy}%）\n一起玩：${url}`;
     try {
       await navigator.clipboard.writeText(text);
       alert("已複製戰報與連結！");
@@ -157,11 +165,40 @@ export default function Page() {
     }
   };
 
+  // 取出本局出現最多的 4 個歌手/團體供推薦
+  const topArtists = () => {
+    const arr = Array.from(artistCountRef.current.entries());
+    arr.sort((a,b)=> b[1]-a[1]);
+    return arr.slice(0,4).map(([name])=>name);
+  };
+
+  // 大字體 HUD（時間/分數）— 手機清楚
+  const hudStyle = {
+    position: "sticky",
+    top: 0,
+    zIndex: 3,
+    display: "flex",
+    gap: 12,
+    flexWrap: "wrap",
+    alignItems: "center",
+    background: "#fff",
+    padding: "8px 0"
+  };
+  const pillStyle = {
+    background: "#111",
+    color: "#fff",
+    padding: "10px 14px",
+    borderRadius: 999,
+    fontWeight: 800,
+    fontSize: "clamp(18px, 5.5vw, 28px)",
+    letterSpacing: "0.5px"
+  };
+
   return (
     <main className="container">
       <h1 className="h1">🎵 GuessWhat — MV 猜歌（60 秒挑戰）</h1>
 
-      {/* 搜尋 + 手動下一題 */}
+      {/* 搜尋列 */}
       <div className="row">
         <input
           value={kw}
@@ -176,50 +213,50 @@ export default function Page() {
         </button>
       </div>
 
-      {/* HUD（大字體，手機友善） */}
-      <div className="hud">
-        <div className="pill">⏱ {timeLeft}s</div>
-        <div className="pill">🎯 命中 {accuracy}%</div>
-        <div className="pill">📊 題數 {qCount}</div>
-        <div className="pill">⭐ 分數 {score}</div>
+      {/* 放大 HUD */}
+      <div style={hudStyle}>
+        <div style={pillStyle}>⏱ {timeLeft}s</div>
+        <div style={pillStyle}>⭐ {score}</div>
+        <div style={pillStyle}>📊 {qCount} 題</div>
+        <div style={pillStyle}>🎯 {accuracy}%</div>
       </div>
 
-      {/* 題目區：播放器 + 強力遮蔽（頂部 15% 實心 + 漸層，下方漸層 + 全域淡遮罩 + 右上遮擋） */}
+      {/* 題目區：只保留「上方 15% 全黑」遮蔽 */}
       <div className="stage" style={{ marginTop: 12, position: "relative" }}>
         <div id="player" ref={playerRef} style={{ width: "100%", height: "100%" }}/>
         {current && !gameOver && (
-          <>
-            {/* 頂部 15% 黑條 */}
-            <div style={{ position:"absolute", left:0, right:0, top:0, height:"15%", background:"#000", pointerEvents:"none" }}/>
-            {/* 頂部漸層銜接 */}
-            <div style={{ position:"absolute", left:0, right:0, top:"15%", height:"12%", background:"linear-gradient(180deg, rgba(0,0,0,0.6), rgba(0,0,0,0))", pointerEvents:"none" }}/>
-            {/* 下方遮蔽（字幕/控制列） */}
-            <div style={{ position:"absolute", left:0, right:0, bottom:0, height:"18%", background:"linear-gradient(0deg, rgba(0,0,0,0.5), rgba(0,0,0,0))", pointerEvents:"none" }}/>
-            {/* 輕微全域遮罩 */}
-            <div style={{ position:"absolute", inset:0, background:"rgba(0,0,0,0.12)", pointerEvents:"none" }}/>
-            {/* 右上擋住「更多影片/關閉」區域（無法跨域點擊，只能遮） */}
-            <div style={{ position:"absolute", top:0, right:0, width:"40%", height:"30%", background:"rgba(0,0,0,0.7)", pointerEvents:"none" }}/>
-          </>
+          <div
+            style={{
+              position:"absolute", left:0, right:0, top:0, height:"15%",
+              background:"#000", pointerEvents:"none"
+            }}
+          />
         )}
       </div>
 
-      {/* 四選一 */}
+      {/* 四選一（用原始上載方名稱） */}
       {current && !gameOver && (
         <div style={{ marginTop: 12, display:"grid", gap: 10 }}>
           {current.choices?.map((c, idx) => {
             const chosen = picked === idx;
             const correct = revealed && idx === current.correctIndex;
             const wrong = revealed && chosen && idx !== current.correctIndex;
-            const style = {
-              textAlign:"left",
-              borderRadius: "14px",
-              padding: "12px 14px",
-              border: chosen ? "2px solid #888" : "1px solid #ccc",
-              background: correct ? "#2e7d32" : wrong ? "#b71c1c" : "#111",
-              color: "#fff"
-            };
             return (
-              <button key={idx} onClick={() => choose(idx)} style={style} disabled={revealed}>
+              <button
+                key={idx}
+                onClick={() => choose(idx)}
+                className="button"
+                style={{
+                  textAlign:"left",
+                  border: chosen ? "2px solid #888" : "1px solid #ccc",
+                  background: correct ? "#2e7d32" : wrong ? "#b71c1c" : "#111",
+                  color: "#fff",
+                  fontSize: "clamp(16px, 4.8vw, 20px)",
+                  padding: "14px 16px",
+                  borderRadius: 14
+                }}
+                disabled={revealed}
+              >
                 {String.fromCharCode(65+idx)}. {c.artist}《{c.title}》
               </button>
             );
@@ -240,16 +277,35 @@ export default function Page() {
         </div>
       )}
 
-      {/* 結算畫面 */}
+      {/* 結束畫面（含依本局最常見歌手的再玩選項） */}
       {gameOver && (
         <div className="card" style={{marginTop:12}}>
           <h3 style={{margin:"8px 0"}}>⏱️ 時間到！成績單</h3>
           <div>總題數：<strong>{qCount}</strong></div>
           <div>總分：<strong>{score}</strong></div>
           <div>正確：<strong>{correctCount}</strong>　錯誤：<strong>{wrongCount}</strong>　命中率：<strong>{accuracy}%</strong></div>
-          <div style={{display:"flex", gap:8, flexWrap:"wrap", marginTop:8}}>
+
+          {/* 推薦四個歌手/團體（按本局統計） */}
+          <div style={{marginTop:10}}>
+            <div className="small" style={{marginBottom:6}}>再玩一次（依你本局常見的歌手/團體）：</div>
+            <div style={{display:"grid", gap:8}}>
+              {topArtists().map((name, i)=>(
+                <button
+                  key={i}
+                  className="button"
+                  onClick={()=>{ const k = name; restart(); setKw(k); startRound(k); }}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{display:"flex", gap:8, flexWrap:"wrap", marginTop:10}}>
             <button className="button" onClick={copySummary}>📋 複製戰報＆連結</button>
-            <button className="button" onClick={()=>{ const k = lastKw || kw; restart(); setKw(k); startRound(k); }}>再玩一次</button>
+            <button className="button" onClick={()=>{ const k = lastKw || kw; restart(); setKw(k); startRound(k); }}>
+              用相同關鍵字再玩
+            </button>
           </div>
         </div>
       )}
